@@ -1,0 +1,225 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <INA226.h>
+#include <GyverButton.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+#define OLED_MOSI   9
+#define OLED_CLK   10
+#define OLED_DC    11
+#define OLED_CS    12
+#define OLED_RESET 13
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT,
+  OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+INA226 ina1(0x40);
+
+#define SHUNT_RESISTANCE 0.0112
+#define MAX_CURRENT 2
+
+#define BUTTON_PIN 3
+#define GPIO_PIN 5
+
+GButton button(BUTTON_PIN);
+bool gpioState = false;
+
+float current1 = 0;
+float voltage1 = 0;
+float power1 = 0;
+
+#define HISTORY_SIZE 60
+#define GRAPH_WIDTH 40
+#define GRAPH_HEIGHT 30
+#define GRAPH_X 85
+#define GRAPH_Y 20
+
+float currentHistory[HISTORY_SIZE];
+uint8_t historyIndex = 0;
+uint32_t lastGraphUpdate = 0;
+#define GRAPH_UPDATE_INTERVAL 5000
+float maxCurrent5min = 0;
+uint32_t lastMaxReset = 0;
+#define MAX_RESET_INTERVAL 300000
+
+struct DisplayLayout {
+  uint8_t headerY = 5;
+  uint8_t separatorY = 15;
+  uint8_t currentY = 20;
+  uint8_t voltageY = 30;
+  uint8_t powerY = 40;
+  uint8_t gpioY = 50;
+  uint8_t valueStartX = 20;
+  uint8_t graphX = GRAPH_X;
+  uint8_t graphY = GRAPH_Y;
+  uint8_t maxValueY = GRAPH_Y + GRAPH_HEIGHT + 5;
+};
+
+DisplayLayout layout;
+
+void setup() {
+  for(uint8_t i = 0; i < 3; i++) {
+    if(display.begin(SSD1306_SWITCHCAPVCC)) break;
+    delay(1000);
+  }
+  
+  display.display();
+  delay(1000);
+  display.clearDisplay();
+  
+  Wire.begin();
+  
+  if(ina1.begin()) {
+    ina1.setMaxCurrentShunt(MAX_CURRENT, SHUNT_RESISTANCE);
+  }
+
+  button.setType(HIGH_PULL);
+  button.setTimeout(300);
+  button.setClickTimeout(500);
+  
+  for (uint8_t i = 0; i < HISTORY_SIZE; i++) {
+    currentHistory[i] = 0;
+  }
+  
+  pinMode(GPIO_PIN, OUTPUT);
+  digitalWrite(GPIO_PIN, LOW);
+
+  delay(3000);
+}
+
+void handleButton() {
+  button.tick();
+  if (button.isClick()) {
+    gpioState = !gpioState;
+    digitalWrite(GPIO_PIN, gpioState ? HIGH : LOW);
+  }
+}
+
+void updateCurrentHistory() {
+  uint32_t currentTime = millis();
+  
+  if (currentTime - lastGraphUpdate >= GRAPH_UPDATE_INTERVAL) {
+    lastGraphUpdate = currentTime;
+    float currentMA = current1 * 0.1f;
+    currentHistory[historyIndex] = currentMA;
+    
+    // Обновляем максимум
+    if (currentMA > maxCurrent5min) {
+      maxCurrent5min = currentMA;
+    }
+    
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+  }
+  
+  // Сбрасываем максимум каждые 5 минут
+  if (currentTime - lastMaxReset >= MAX_RESET_INTERVAL) {
+    lastMaxReset = currentTime;
+    maxCurrent5min = 0;
+    
+    // Находим новый максимум из истории
+    for (uint8_t i = 0; i < HISTORY_SIZE; i++) {
+      if (currentHistory[i] > maxCurrent5min) {
+        maxCurrent5min = currentHistory[i];
+      }
+    }
+  }
+}
+
+void drawGraph() {
+  // Рамка графика
+  display.drawRect(layout.graphX, layout.graphY, GRAPH_WIDTH, GRAPH_HEIGHT, SSD1306_WHITE);
+  
+  // Заголовок графика
+  display.setTextSize(1);
+  display.setCursor(layout.graphX + 8, layout.graphY - 15);
+  display.print(F("5min"));
+  
+  // Максимальное значение
+  display.setCursor(layout.graphX, layout.maxValueY);
+  display.print(F("Max:"));
+  display.print(maxCurrent5min, 0);
+  display.print(F("mA"));
+  
+  // Масштабирование графика
+  float graphMax = max(maxCurrent5min, 1.0f);
+  if (graphMax > 10) graphMax = ((int)graphMax + 5) / 5 * 5;
+  
+  // Рисуем график
+  int8_t prevX = -1, prevY = -1;
+  
+  for (uint8_t i = 0; i < HISTORY_SIZE; i++) {
+    uint8_t index = (historyIndex + i) % HISTORY_SIZE;
+    if (currentHistory[index] > 0) {
+      int8_t x = layout.graphX + (i * GRAPH_WIDTH / HISTORY_SIZE);
+      int8_t y = layout.graphY + GRAPH_HEIGHT - constrain((int)(currentHistory[index] * GRAPH_HEIGHT / graphMax), 0, GRAPH_HEIGHT);
+      
+      if (prevX != -1) {
+        display.drawLine(prevX, prevY, x, y, SSD1306_WHITE);
+      }
+      
+      display.drawPixel(x, y, SSD1306_WHITE);
+      prevX = x;
+      prevY = y;
+    }
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+
+  // Заголовок
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(40, layout.headerY);
+  display.print(F("Monitor"));
+  
+  // Разделительная линия
+  display.drawLine(0, layout.separatorY, 80, layout.separatorY, SSD1306_WHITE);
+  
+  // Данные
+  display.setCursor(0, layout.currentY);
+  display.print(F("C:"));
+  display.setCursor(layout.valueStartX, layout.currentY);
+  display.print(current1 * 0.1f, 1);
+  display.print(F("mA"));
+  
+  display.setCursor(0, layout.voltageY);
+  display.print(F("V:"));
+  display.setCursor(layout.valueStartX, layout.voltageY);
+  display.print(voltage1, 1);
+  display.print(F("V"));
+  
+  display.setCursor(0, layout.powerY);
+  display.print(F("P:"));
+  display.setCursor(layout.valueStartX, layout.powerY);
+  display.print(power1, 0);
+  display.print(F("mW"));
+  
+  // Состояние GPIO
+  display.setCursor(0, layout.gpioY);
+  display.print(F("GPIO:"));
+  display.print(gpioState ? F("ON") : F("OFF"));
+  
+  // График с максимальным значением
+  drawGraph();
+  
+  display.display();
+}
+
+void loop() {
+  if(ina1.isConnected()) {
+    current1 = ina1.getCurrent_mA();
+    voltage1 = ina1.getBusVoltage();
+    power1 = ina1.getPower_mW();
+  }
+  
+  handleButton();
+  updateCurrentHistory();
+  updateDisplay();
+  
+  //delay(100);
+}
